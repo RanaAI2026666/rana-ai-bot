@@ -3,7 +3,6 @@ import io
 import base64
 import asyncio
 import tempfile
-import subprocess
 from pathlib import Path
 
 import discord
@@ -17,10 +16,22 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 
 MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024
 OPENAI_MODEL = "gpt-4.1-mini"
+IMAGE_MODEL = os.environ.get("OPENAI_IMAGE_MODEL", "gpt-image-2.5-flare")
+TTS_MODEL = os.environ.get("OPENAI_TTS_MODEL", "gpt-4o-mini-tts")
+TTS_VOICE = os.environ.get("OPENAI_TTS_VOICE", "marin")
 
 intents = discord.Intents.default()
 intents.message_content = True
 bot = discord.Client(intents=intents)
+
+
+def extract_text(data):
+    return "".join(
+        item.get("text", "")
+        for output in data.get("output", [])
+        for item in output.get("content", [])
+        if item.get("type") == "output_text"
+    ).strip()
 
 
 async def openai_image_analysis(session, image_url, prompt):
@@ -43,12 +54,7 @@ async def openai_image_analysis(session, image_url, prompt):
         data = await response.json()
         if response.status >= 400:
             raise RuntimeError(data.get("error", {}).get("message", "OpenAI image request failed"))
-    return "".join(
-        item.get("text", "")
-        for output in data.get("output", [])
-        for item in output.get("content", [])
-        if item.get("type") == "output_text"
-    ).strip()
+    return extract_text(data)
 
 
 async def openai_transcribe(session, attachment):
@@ -79,7 +85,6 @@ async def openai_video_analysis(session, attachment, prompt):
     with tempfile.TemporaryDirectory() as tmp:
         video_path = Path(tmp) / "clip.mp4"
         video_path.write_bytes(raw)
-        # Sample four representative frames across the clip.
         cmd = [ffmpeg, "-v", "error", "-i", str(video_path), "-vf",
                "fps=1/3,scale=768:-1", "-frames:v", "4", str(Path(tmp) / "frame-%02d.jpg")]
         proc = await asyncio.create_subprocess_exec(
@@ -107,12 +112,65 @@ async def openai_video_analysis(session, attachment, prompt):
             data = await response.json()
             if response.status >= 400:
                 raise RuntimeError(data.get("error", {}).get("message", "OpenAI video request failed"))
-        return "".join(
-            item.get("text", "")
-            for output in data.get("output", [])
-            for item in output.get("content", [])
-            if item.get("type") == "output_text"
-        ).strip()
+        return extract_text(data)
+
+
+async def generate_image(session, prompt):
+    payload = {
+        "model": IMAGE_MODEL,
+        "prompt": prompt[:32000],
+        "size": "1024x1024",
+        "quality": "medium",
+        "n": 1,
+        "output_format": "png"
+    }
+    async with session.post(
+        "https://api.openai.com/v1/images/generations",
+        headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
+        json=payload,
+        timeout=aiohttp.ClientTimeout(total=240)
+    ) as response:
+        data = await response.json()
+        if response.status >= 400:
+            raise RuntimeError(data.get("error", {}).get("message", "فشل إنشاء الصورة"))
+    encoded = data.get("data", [{}])[0].get("b64_json")
+    if not encoded:
+        raise RuntimeError("لم تصل الصورة من خدمة الإنشاء.")
+    return base64.b64decode(encoded)
+
+
+async def generate_speech(session, text):
+    if len(text) > 3500:
+        text = text[:3500]
+    payload = {
+        "model": TTS_MODEL,
+        "input": text,
+        "voice": TTS_VOICE,
+        "instructions": "Speak Arabic naturally and warmly, with a friendly conversational tone.",
+        "response_format": "mp3"
+    }
+    async with session.post(
+        "https://api.openai.com/v1/audio/speech",
+        headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
+        json=payload,
+        timeout=aiohttp.ClientTimeout(total=240)
+    ) as response:
+        if response.status >= 400:
+            try:
+                data = await response.json()
+                detail = data.get("error", {}).get("message", "فشل توليد الصوت")
+            except Exception:
+                detail = "فشل توليد الصوت"
+            raise RuntimeError(detail)
+        return await response.read()
+
+
+def command_prompt(content, prefixes):
+    lower = content.lower().strip()
+    for prefix in prefixes:
+        if lower.startswith(prefix):
+            return content[len(prefix):].strip()
+    return None
 
 
 async def process_attachments(message, session):
@@ -158,10 +216,53 @@ async def on_message(message):
     if message.author.bot:
         return
 
+    content = (message.content or "").strip()
+    if not content and not message.attachments:
+        return
+
+    if not OPENAI_API_KEY and any(x in content.lower() for x in ("!صورة", "!صوت", "!image", "!voice")):
+        await message.reply("ميزة الإنشاء تحتاج ضبط مفتاح OpenAI في إعدادات البوت.")
+        return
+
+    image_prompt = command_prompt(content, ("!صورة", "!image", "ارسم صورة:", "أنشئ صورة:", "انشئ صورة:"))
+    speech_text = command_prompt(content, ("!صوت", "!voice", "اقرأ بصوت:", "حوّل إلى صوت:", "حول الى صوت:"))
+    video_prompt = command_prompt(content, ("!فيديو", "!video", "أنشئ فيديو:", "انشئ فيديو:"))
+
     try:
         async with aiohttp.ClientSession() as session:
+            if image_prompt is not None:
+                if not image_prompt:
+                    await message.reply("اكتب وصف الصورة بعد الأمر، مثل: !صورة قطة صغيرة في حديقة.")
+                    return
+                async with message.channel.typing():
+                    image_bytes = await generate_image(session, image_prompt)
+                await message.reply(
+                    content="هذه الصورة التي أنشأتها لك. الصورة مولّدة بالذكاء الاصطناعي.",
+                    file=discord.File(io.BytesIO(image_bytes), filename="rana-image.png")
+                )
+                return
+
+            if speech_text is not None:
+                if not speech_text:
+                    await message.reply("اكتب النص بعد الأمر، مثل: !صوت مرحبًا، كيف حالك؟")
+                    return
+                async with message.channel.typing():
+                    audio_bytes = await generate_speech(session, speech_text)
+                await message.reply(
+                    content="هذا تسجيل صوتي مولّد بالذكاء الاصطناعي بصوت رنا.",
+                    file=discord.File(io.BytesIO(audio_bytes), filename="rana-voice.mp3")
+                )
+                return
+
+            if video_prompt is not None:
+                await message.reply(
+                    "أقدر حاليًا أنشئ لك صورة وأرسلها، وأحوّل النص إلى صوت. "
+                    "لكن خدمة إنشاء الفيديو عبر OpenAI API أُوقفت، لذلك لا أستطيع إنشاء MP4 حقيقي الآن."
+                )
+                return
+
             attachment_context = await process_attachments(message, session)
-            user_text = message.content or ""
+            user_text = content
             if attachment_context:
                 user_text = (user_text + "\n\n" + attachment_context).strip()
             if not user_text:
@@ -189,7 +290,7 @@ async def on_message(message):
             await message.reply(attachment_context[:2000])
     except Exception as exc:
         print(f"Message processing error: {type(exc).__name__}: {exc}")
-        await message.reply("عذرًا، واجهت مشكلة أثناء معالجة رسالتك. حاول مرة أخرى بعد قليل.")
+        await message.reply("عذرًا، واجهت مشكلة أثناء معالجة طلبك. حاول مرة أخرى بعد قليل.")
 
 
 bot.run(DISCORD_TOKEN)
