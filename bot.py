@@ -139,6 +139,49 @@ async def generate_image(session, prompt):
     return base64.b64decode(encoded)
 
 
+async def generate_selfie(session, prompt):
+    # Use the Nomi profile avatar as a visual reference so the generated
+    # portrait is closer to Rana's established appearance.
+    async with session.get(
+        f"https://api.nomi.ai/v1/nomis/{NOMI_ID}/avatar",
+        headers={"Authorization": NOMI_API_KEY},
+        timeout=aiohttp.ClientTimeout(total=60)
+    ) as response:
+        if response.status >= 400:
+            raise RuntimeError("تعذر جلب صورة رنا الشخصية من Nomi.")
+        avatar_bytes = await response.read()
+
+    form = aiohttp.FormData()
+    form.add_field("model", IMAGE_MODEL)
+    form.add_field(
+        "prompt",
+        "Create a new realistic selfie of the same fictional AI character shown in the reference image. "
+        "Preserve her recognizable facial features, hairstyle, and overall identity as closely as possible. "
+        "Do not copy the exact profile-picture framing; create a natural new selfie. "
+        + (prompt or "A warm, friendly casual selfie, natural lighting.")
+    )
+    form.add_field("size", "1024x1024")
+    form.add_field("quality", "medium")
+    form.add_field("n", "1")
+    form.add_field("output_format", "png")
+    form.add_field("image", avatar_bytes, filename="rana-reference.webp", content_type="image/webp")
+
+    async with session.post(
+        "https://api.openai.com/v1/images/edits",
+        headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+        data=form,
+        timeout=aiohttp.ClientTimeout(total=300)
+    ) as response:
+        data = await response.json()
+        if response.status >= 400:
+            detail = data.get("error", {}).get("message", "فشل إنشاء صورة رنا.")
+            raise RuntimeError(detail)
+    encoded = data.get("data", [{}])[0].get("b64_json")
+    if not encoded:
+        raise RuntimeError("لم تصل الصورة من خدمة الإنشاء.")
+    return base64.b64decode(encoded)
+
+
 async def generate_speech(session, text):
     if len(text) > 3500:
         text = text[:3500]
@@ -224,12 +267,22 @@ async def on_message(message):
         await message.reply("ميزة الإنشاء تحتاج ضبط مفتاح OpenAI في إعدادات البوت.")
         return
 
+    selfie_prompt = command_prompt(content, ("!سيلفي", "!selfie", "!رنا"))
     image_prompt = command_prompt(content, ("!صورة", "!image", "ارسم صورة:", "أنشئ صورة:", "انشئ صورة:"))
     speech_text = command_prompt(content, ("!صوت", "!voice", "اقرأ بصوت:", "حوّل إلى صوت:", "حول الى صوت:"))
     video_prompt = command_prompt(content, ("!فيديو", "!video", "أنشئ فيديو:", "انشئ فيديو:"))
 
     try:
         async with aiohttp.ClientSession() as session:
+            if selfie_prompt is not None:
+                async with message.channel.typing():
+                    image_bytes = await generate_selfie(session, selfie_prompt)
+                await message.reply(
+                    content="هذه صورة جديدة لرنا، أنشأتها بالاستعانة بصورتها الشخصية كمرجع. قد لا تطابق سيلفي Nomi الأصلية تمامًا.",
+                    file=discord.File(io.BytesIO(image_bytes), filename="rana-selfie.png")
+                )
+                return
+
             if image_prompt is not None:
                 if not image_prompt:
                     await message.reply("اكتب وصف الصورة بعد الأمر، مثل: !صورة قطة صغيرة في حديقة.")
